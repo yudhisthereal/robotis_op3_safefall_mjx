@@ -23,12 +23,13 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+from flax import struct
 
 
 # ── Perturbation state ──────────────────────────────────────────────
 
 
-@dataclasses.dataclass(frozen=True)
+@struct.dataclass
 class PerturbationState:
     """Immutable state carried between steps for stateful perturbations."""
 

@@ -25,6 +25,7 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+from flax import struct
 import mujoco
 import mujoco.mjx as mjx
 
@@ -42,7 +43,7 @@ from utils.metrics import compute_peak_contact_force, compute_peak_torque
 # ── Environment state ────────────────────────────────────────────────
 
 
-@dataclasses.dataclass(frozen=True)
+@struct.dataclass
 class SafeFallState:
     """Immutable environment state."""
 
