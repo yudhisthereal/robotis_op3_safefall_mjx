@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 
 # Keep matmul precision stable across backends
+jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_default_matmul_precision", "float32")
 
 import wandb
