@@ -16,8 +16,8 @@ and produces a categorical distribution over strategies.  At each
 *decision point* it selects a strategy that is passed to the low-level
 controller which then runs for the remainder of the episode.
 
-Reward (placeholder): The high-level agent's reward is the **total
-episode reward accumulated by the low-level controller**.
+Reward: strategy-conditioned low-level proxy control with uprightness,
+impact, and effort shaping.
 
 Shares perturbation / DR / termination / metrics systems.
 """
@@ -32,7 +32,7 @@ import jax.numpy as jnp
 import mujoco
 import mujoco.mjx as mjx
 
-from envs.op3_low_level_fall import NUM_STRATEGIES, OP3LowLevelFallEnv, LowLevelFallState
+from envs.op3_low_level_fall import NUM_STRATEGIES
 from utils.config import Config
 from utils.perturbations import (
     PerturbationState,
@@ -59,31 +59,20 @@ class HighLevelFallState:
 
 
 class OP3HighLevelFallEnv:
-    """High-level strategy selector using discrete PPO.
+    """High-level strategy selector trained with a continuous PPO head.
 
-    This environment is a **wrapper** around :class:`OP3LowLevelFallEnv`.
-    The high-level policy selects a strategy once per episode; the
-    low-level policy then runs for ``episode_max_steps`` time-steps.
-
-    For training the high-level policy, we:
-    1. Reset the low-level env with the chosen strategy.
-    2. Execute the low-level policy for the entire episode.
-    3. Return the accumulated reward to the high-level policy.
-
-    This file exposes a simplified ``reset`` / ``step`` API for the
-    outer training loop, where ``step`` is called **once per episode**
-    with the strategy index as the action.
+    The policy outputs strategy preferences; the selected strategy is
+    converted into a low-level action template and executed for one
+    control interval.
     """
 
     def __init__(
         self,
         config: Config,
         mj_model: mujoco.MjModel,
-        low_level_env: OP3LowLevelFallEnv | None = None,
     ):
         self.config = config
         self.mj_model = mj_model
-        self.low_level_env = low_level_env or OP3LowLevelFallEnv(config, mj_model)
 
         self.torso_body_idx = mj_model.body("body_link").id
         self.l_foot_body_idx = mj_model.body("l_ank_roll_link").id
@@ -112,6 +101,11 @@ class OP3HighLevelFallEnv:
     def num_strategies(self) -> int:
         return NUM_STRATEGIES
 
+    @property
+    def action_dim(self) -> int:
+        """High-level policy outputs logits/preferences over strategies."""
+        return NUM_STRATEGIES
+
     # ── observation ──────────────────────────────────────────────────
 
     def _build_obs(self, data: mjx.Data) -> jnp.ndarray:
@@ -126,6 +120,56 @@ class OP3HighLevelFallEnv:
             sd[self._linvel_adr[0]:self._linvel_adr[1]],
             sd[self._angvel_adr[0]:self._angvel_adr[1]],
         ])
+
+    def _strategy_to_action(self, strategy_idx: jnp.ndarray) -> jnp.ndarray:
+        """Map a discrete strategy id to a low-level action template."""
+        arm_bracing = jnp.array([
+            0.0, 0.1,
+            0.8, 0.2, -0.8,
+            0.8, -0.2, -0.8,
+            0.0, 0.0, 0.1,
+            -0.1, 0.0, 0.0,
+            0.0, 0.0, 0.1,
+            -0.1, 0.0, 0.0,
+        ], dtype=jnp.float32)
+        roll = jnp.array([
+            0.0, 0.0,
+            0.3, 0.6, -0.3,
+            0.3, -0.6, -0.3,
+            0.0, 0.4, 0.7,
+            -1.0, 0.4, 0.3,
+            0.0, -0.4, 0.7,
+            -1.0, 0.4, -0.3,
+        ], dtype=jnp.float32)
+        squat_fwd = jnp.array([
+            0.0, 0.2,
+            0.2, 0.0, -0.2,
+            0.2, 0.0, -0.2,
+            0.0, 0.0, 1.0,
+            -1.2, 0.7, 0.0,
+            0.0, 0.0, 1.0,
+            -1.2, 0.7, 0.0,
+        ], dtype=jnp.float32)
+        squat_bwd = jnp.array([
+            0.0, -0.1,
+            -0.2, 0.0, 0.2,
+            -0.2, 0.0, 0.2,
+            0.0, 0.0, -0.8,
+            1.0, -0.6, 0.0,
+            0.0, 0.0, -0.8,
+            1.0, -0.6, 0.0,
+        ], dtype=jnp.float32)
+        side = jnp.array([
+            0.0, 0.0,
+            0.4, 0.9, -0.2,
+            0.1, -0.2, -0.2,
+            0.0, 0.8, 0.5,
+            -0.8, 0.2, 0.6,
+            0.0, -0.2, 0.1,
+            -0.2, 0.1, -0.5,
+        ], dtype=jnp.float32)
+        templates = jnp.stack([arm_bracing, roll, squat_fwd, squat_bwd, side], axis=0)
+        return templates[strategy_idx]
 
     # ── termination (shared) ─────────────────────────────────────────
 
@@ -171,38 +215,38 @@ class OP3HighLevelFallEnv:
         action: jnp.ndarray,
         rng: jax.Array,
     ) -> HighLevelFallState:
-        """Execute one *high-level* step.
-
-        ``action`` is a **strategy index** (integer or one-hot logits).
-        We treat it as the argmax of a continuous action vector to keep
-        the API compatible with the PPO agent (continuous output that is
-        discretised here).
-
-        The reward returned is a placeholder; in the full hierarchical
-        pipeline the low-level episode reward would be fed back here.
-        """
+        """Execute one high-level strategy selection and low-level proxy step."""
         # Discretise continuous action → strategy index
         strategy_idx = jnp.argmax(action[:NUM_STRATEGIES])
 
-        # For now, we just run one physics step as a proxy – the full
-        # hierarchical pipeline would unroll the low-level controller.
         data = state.mjx_data
-        # Zero-action step (high-level doesn't directly control joints)
-        data = data.replace(ctrl=jnp.zeros(self.config.num_actions))
-        next_data = mjx.step(mjx_model, data)
+        low_level_action = self._strategy_to_action(strategy_idx)
+        data = data.replace(ctrl=jnp.clip(low_level_action, -1.0, 1.0))
+
+        def _substep(d, _):
+            return mjx.step(mjx_model, d), None
+
+        next_data, _ = jax.lax.scan(_substep, data, None, length=self.config.physics_steps_per_control)
 
         obs = self._build_obs(next_data)
         new_step = state.step_count + 1
         done = self._check_termination(next_data, new_step)
 
-        # Placeholder reward – in full pipeline this comes from low-level
         torso_z = next_data.qpos[2]
-        reward = torso_z / 0.3 + jnp.where(torso_z > 0.05, 1.0, 0.0)
+        torso_quat = next_data.sensordata[self._quat_adr[0]:self._quat_adr[1]]
+        upright = jnp.clip(jnp.abs(torso_quat[0]), 0.0, 1.0)
+        impact_penalty = -0.0002 * jnp.mean(jnp.square(next_data.qfrc_constraint))
+        effort_penalty = -0.001 * jnp.mean(jnp.square(low_level_action))
+        alive = jnp.where(torso_z > 0.05, 0.2, -0.8)
+        reward = 0.8 * upright + 0.4 * jnp.clip(torso_z / 0.3, 0.0, 1.2) + impact_penalty + effort_penalty + alive
 
         info = {
             "episode_reward": state.info["episode_reward"] + reward,
-            "peak_torque": state.info["peak_torque"],
-            "peak_contact_force": state.info["peak_contact_force"],
+            "peak_torque": jnp.maximum(state.info["peak_torque"], jnp.max(jnp.abs(low_level_action))),
+            "peak_contact_force": jnp.maximum(
+                state.info["peak_contact_force"],
+                jnp.sum(jnp.abs(next_data.qfrc_constraint)),
+            ),
         }
 
         return HighLevelFallState(

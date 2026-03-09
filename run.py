@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
 from collections import deque
 
@@ -28,15 +27,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-# Force JAX to use GPU if available
+# Keep matmul precision stable across backends
 jax.config.update("jax_default_matmul_precision", "float32")
 
 import wandb
 
 from utils.config import Config, make_config
-from utils.env import load_mjx_model, make_rng_keys
+from utils.domain_randomization import batch_randomize_model
+from utils.env import load_mjx_model
 from utils.checkpoint import save_checkpoint, BestModelTracker
-from utils.metrics import aggregate_episode_metrics, batch_peak_torque
+from utils.evaluator import evaluate
+from utils.metrics import batch_peak_torque
 from utils.render_worker import start_render_worker
 from utils.replay_buffer import RolloutBuffer
 
@@ -85,6 +86,12 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
+    # Respect CLI device request before backend is first used.
+    try:
+        jax.config.update("jax_platform_name", args.device)
+    except Exception as exc:  # pragma: no cover (depends on local backend)
+        print(f"[run.py] Warning: failed to enforce device '{args.device}': {exc}")
+
     # ── Config ───────────────────────────────────────────────────────
     config = make_config(
         env_name=args.env,
@@ -124,8 +131,20 @@ def main():
     print(f"[run.py] PPO agent initialised.")
 
     # ── Vectorised env functions ─────────────────────────────────────
-    v_reset = jax.jit(jax.vmap(env.reset, in_axes=(None, 0)))
-    v_step = jax.jit(jax.vmap(env.step, in_axes=(None, 0, 0, 0)))
+    # Domain randomization produces one model per environment.
+    v_reset = jax.jit(jax.vmap(env.reset, in_axes=(0, 0)))
+    v_step = jax.jit(jax.vmap(env.step, in_axes=(0, 0, 0, 0)))
+
+    def randomize_models(rng_key: jax.Array) -> jax.Array:
+        return batch_randomize_model(
+            mjx_model,
+            rng_key,
+            config.num_envs,
+            mass_range=config.dr_mass_range,
+            damping_range=config.dr_damping_range,
+            friction_range=config.dr_friction_range,
+            ground_friction_range=config.dr_ground_friction_range,
+        )
 
     # ── WandB ────────────────────────────────────────────────────────
     wandb.init(
@@ -154,9 +173,10 @@ def main():
         print("[run.py] Render worker started.")
 
     # ── Training loop ────────────────────────────────────────────────
-    rng, rng_reset = jax.random.split(train_state.rng)
+    rng, rng_reset, rng_dr = jax.random.split(train_state.rng, 3)
     env_keys = jax.random.split(rng_reset, config.num_envs)
-    states = v_reset(mjx_model, env_keys)
+    env_models = randomize_models(rng_dr)
+    states = v_reset(env_models, env_keys)
 
     global_step = 0
     global_episode = 0
@@ -169,8 +189,9 @@ def main():
     try:
         while True:
             # ── Collect rollout ──────────────────────────────────────
+            goal_dim = int(states.goal.shape[-1]) if hasattr(states, "goal") else 0
             buffer = RolloutBuffer.create(
-                config.num_envs, config.rollout_length, obs_dim, action_dim,
+                config.num_envs, config.rollout_length, obs_dim, action_dim, goal_dim=goal_dim,
             )
 
             rng, rng_rollout = jax.random.split(rng)
@@ -191,11 +212,12 @@ def main():
 
                 # Step environments
                 step_keys = jax.random.split(rollout_keys[t], config.num_envs)
-                next_states = v_step(mjx_model, states, actions, step_keys)
+                next_states = v_step(env_models, states, actions, step_keys)
 
                 # Store transition
+                goals = states.goal if hasattr(states, "goal") else None
                 buffer = buffer.store(
-                    t, obs, actions, next_states.reward, values, log_probs, next_states.done,
+                    t, obs, actions, next_states.reward, values, log_probs, next_states.done, goals=goals,
                 )
 
                 # Track per-env metrics
@@ -222,8 +244,10 @@ def main():
                     episode_lengths_accum = jnp.where(done_mask, 0, episode_lengths_accum)
 
                 # Reset done environments
+                rng, rng_dr_reset = jax.random.split(rng)
                 reset_keys = jax.random.split(rng_autoreset, config.num_envs)
-                fresh_states = v_reset(mjx_model, reset_keys)
+                fresh_models = randomize_models(rng_dr_reset)
+                fresh_states = v_reset(fresh_models, reset_keys)
                 # Merge: use fresh state where done, keep next_state otherwise
                 states = jax.tree.map(
                     lambda fresh, cont: jnp.where(
@@ -231,6 +255,13 @@ def main():
                     ),
                     fresh_states,
                     next_states,
+                )
+                env_models = jax.tree.map(
+                    lambda fresh, cont: jnp.where(
+                        done_mask.reshape((-1,) + (1,) * (fresh.ndim - 1)), fresh, cont
+                    ),
+                    fresh_models,
+                    env_models,
                 )
 
                 global_step += config.num_envs
@@ -264,6 +295,30 @@ def main():
                     f"ploss={float(update_metrics['policy_loss']):>8.4f}  "
                     f"vloss={float(update_metrics['value_loss']):>8.4f}  "
                     f"ent={float(update_metrics['entropy']):>7.4f}"
+                )
+
+            # ── Deterministic evaluation ────────────────────────────
+            if update_count % config.eval_interval == 0:
+                rng, rng_eval = jax.random.split(rng)
+                eval_metrics = evaluate(
+                    policy_apply_fn=agent.networks.policy.apply,
+                    params=train_state.params["policy"],
+                    reset_fn=env.reset,
+                    step_fn=env.step,
+                    mjx_model=mjx_model,
+                    rng=rng_eval,
+                    config=config,
+                    num_eval_episodes=config.num_eval_episodes,
+                )
+                wandb.log(
+                    {
+                        "eval/mean_reward": eval_metrics["mean_reward"],
+                        "eval/episode_length": eval_metrics["episode_length"],
+                        "eval/success_rate": eval_metrics["success_rate"],
+                        "global_step": global_step,
+                        "update": update_count,
+                    },
+                    step=global_step,
                 )
 
             # ── Checkpointing ────────────────────────────────────────

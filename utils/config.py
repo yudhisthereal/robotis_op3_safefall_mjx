@@ -42,9 +42,9 @@ class Config:
     )
 
     # ── Observation dimensions (computed later, but defaults) ────────
-    obs_size_safefall: int = 67  # placeholder – overridden at runtime
-    obs_size_low_level: int = 72  # robot_state + one-hot goal
-    obs_size_high_level: int = 67  # same as safefall obs
+    obs_size_safefall: int = 56  # robot_state only
+    obs_size_low_level: int = 61  # robot_state (56) + one-hot goal (5)
+    obs_size_high_level: int = 56  # same as safefall obs
     num_strategies: int = 5  # arm_bracing, roll, squat_fwd, squat_bwd, side
 
     # ── PPO ──────────────────────────────────────────────────────────
@@ -84,6 +84,8 @@ class Config:
     wandb_project: str = "op3-safefall-mjx"
     wandb_entity: Optional[str] = None
     log_interval: int = 10  # updates between WandB logs
+    eval_interval: int = 50  # updates between deterministic evaluations
+    num_eval_episodes: int = 16
 
     # ── Rendering ────────────────────────────────────────────────────
     render_interval_episodes: int = 1000

@@ -11,7 +11,7 @@ execute the corresponding protective manoeuvre:
 
 Observation = ``robot_state ‖ goal_one_hot``
 
-Reward = ``r_safety + r_strategy``  (placeholder — tune per strategy).
+Reward = ``r_safety + r_strategy`` with strategy-target tracking and safety shaping.
 
 Shares the same perturbation, domain-randomisation, termination, and
 metrics systems as the other environments.
@@ -120,25 +120,87 @@ class OP3LowLevelFallEnv:
         robot_obs = self._build_robot_obs(data)
         return jnp.concatenate([robot_obs, goal])
 
-    # ── reward (placeholder per strategy) ────────────────────────────
+    def _strategy_target_action(self, goal: jnp.ndarray) -> jnp.ndarray:
+        """Return a simple strategy-specific target action template."""
+        # Joint groups in actuator order:
+        # 0:head_pan, 1:head_tilt,
+        # 2:l_sho_pitch, 3:l_sho_roll, 4:l_el,
+        # 5:r_sho_pitch, 6:r_sho_roll, 7:r_el,
+        # 8:l_hip_yaw, 9:l_hip_roll, 10:l_hip_pitch,
+        # 11:l_knee, 12:l_ank_pitch, 13:l_ank_roll,
+        # 14:r_hip_yaw, 15:r_hip_roll, 16:r_hip_pitch,
+        # 17:r_knee, 18:r_ank_pitch, 19:r_ank_roll
+        arm_bracing = jnp.array([
+            0.0, 0.1,
+            0.8, 0.2, -0.8,
+            0.8, -0.2, -0.8,
+            0.0, 0.0, 0.1,
+            -0.1, 0.0, 0.0,
+            0.0, 0.0, 0.1,
+            -0.1, 0.0, 0.0,
+        ], dtype=jnp.float32)
+        roll = jnp.array([
+            0.0, 0.0,
+            0.3, 0.6, -0.3,
+            0.3, -0.6, -0.3,
+            0.0, 0.4, 0.7,
+            -1.0, 0.4, 0.3,
+            0.0, -0.4, 0.7,
+            -1.0, 0.4, -0.3,
+        ], dtype=jnp.float32)
+        squat_fwd = jnp.array([
+            0.0, 0.2,
+            0.2, 0.0, -0.2,
+            0.2, 0.0, -0.2,
+            0.0, 0.0, 1.0,
+            -1.2, 0.7, 0.0,
+            0.0, 0.0, 1.0,
+            -1.2, 0.7, 0.0,
+        ], dtype=jnp.float32)
+        squat_bwd = jnp.array([
+            0.0, -0.1,
+            -0.2, 0.0, 0.2,
+            -0.2, 0.0, 0.2,
+            0.0, 0.0, -0.8,
+            1.0, -0.6, 0.0,
+            0.0, 0.0, -0.8,
+            1.0, -0.6, 0.0,
+        ], dtype=jnp.float32)
+        side = jnp.array([
+            0.0, 0.0,
+            0.4, 0.9, -0.2,
+            0.1, -0.2, -0.2,
+            0.0, 0.8, 0.5,
+            -0.8, 0.2, 0.6,
+            0.0, -0.2, 0.1,
+            -0.2, 0.1, -0.5,
+        ], dtype=jnp.float32)
+
+        templates = jnp.stack([arm_bracing, roll, squat_fwd, squat_bwd, side], axis=0)
+        return jnp.sum(templates * goal[:, None], axis=0)
+
+    # ── reward (strategy-conditioned) ────────────────────────────────
 
     def _compute_reward(
         self, data: mjx.Data, prev_data: mjx.Data, action: jnp.ndarray, goal: jnp.ndarray
     ) -> jnp.ndarray:
-        """``r = r_safety + r_strategy``  (placeholder).
-
-        TODO: Implement per-strategy reward shaping.
-        """
+        """``r = r_safety + r_strategy`` with strategy-target tracking."""
         torso_z = data.qpos[2]
-        upright = torso_z / 0.3
-        torque_pen = -0.001 * jnp.sum(jnp.square(action))
-        alive = jnp.where(torso_z > 0.05, 1.0, 0.0)
+        torso_quat = data.sensordata[self._quat_adr[0]:self._quat_adr[1]]
+        upright = jnp.clip(jnp.abs(torso_quat[0]), 0.0, 1.0)
 
-        # Placeholder strategy bonus – weight could differ per strategy
-        strategy_idx = jnp.argmax(goal)
-        strategy_bonus = 0.0  # TODO: implement per-strategy shaping
+        torque_pen = -0.001 * jnp.mean(jnp.square(action))
+        contact_pen = -0.0002 * jnp.mean(jnp.square(data.qfrc_constraint))
+        smoothness_pen = -0.0005 * jnp.mean(jnp.square(action - prev_data.ctrl))
 
-        return upright + torque_pen + alive + strategy_bonus
+        target_action = self._strategy_target_action(goal)
+        strategy_err = jnp.mean(jnp.square(jnp.tanh(action) - jnp.tanh(target_action)))
+        strategy_bonus = 0.6 * jnp.exp(-4.0 * strategy_err)
+
+        alive = jnp.where(torso_z > 0.05, 0.2, -0.5)
+        fallen_penalty = jnp.where(torso_z < 0.05, -1.5, 0.0)
+
+        return 0.8 * upright + 0.4 * jnp.clip(torso_z / 0.3, 0.0, 1.2) + strategy_bonus + torque_pen + contact_pen + smoothness_pen + alive + fallen_penalty
 
     # ── termination (shared logic) ───────────────────────────────────
 

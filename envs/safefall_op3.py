@@ -14,7 +14,7 @@ Design
 
 Reward
 ------
-``r = r_safety + r_stability``  (placeholder weights – tune via config).
+``r = r_safety + r_stability`` with uprightness, impact, effort, and smoothness terms.
 """
 
 from __future__ import annotations
@@ -120,29 +120,44 @@ class SafeFallOP3Env:
         angvel = sd[self._angvel_adr[0]:self._angvel_adr[1]]
         return jnp.concatenate([joint_pos, joint_vel, accel, gyro, quat, linvel, angvel])
 
-    # ── reward (placeholder) ─────────────────────────────────────────
+    # ── reward ───────────────────────────────────────────────────────
 
     def _compute_reward(
         self, data: mjx.Data, prev_data: mjx.Data, action: jnp.ndarray
     ) -> jnp.ndarray:
-        """Compute ``r = r_safety + r_stability``.
+        """Compute SafeFall reward with stability and safety shaping."""
+        torso_z = data.qpos[2]
 
-        TODO: Replace placeholder terms with proper SafeFall reward shaping.
-        """
-        # --- r_stability: reward for keeping torso upright ---
-        torso_z = data.qpos[2]  # height of base link
-        upright_reward = torso_z / 0.3  # normalised by nominal standing height
+        # Orientation from torso quaternion sensor (w, x, y, z)
+        sd = data.sensordata
+        torso_quat = sd[self._quat_adr[0]:self._quat_adr[1]]
+        upright = jnp.clip(jnp.abs(torso_quat[0]), 0.0, 1.0)
 
-        # --- r_safety: penalise large torques and contact forces ---
-        torque_penalty = -0.001 * jnp.sum(jnp.square(action))
-        contact_force = jnp.sum(jnp.abs(data.qfrc_constraint))
-        contact_penalty = -0.0001 * contact_force
+        # Stability
+        height_term = jnp.clip(torso_z / 0.30, 0.0, 1.2)
+        linear_vel_penalty = -0.02 * jnp.linalg.norm(data.qvel[0:3])
+        angular_vel_penalty = -0.01 * jnp.linalg.norm(data.qvel[3:6])
 
-        # --- alive bonus ---
-        alive = jnp.where(torso_z > 0.05, 1.0, 0.0)
+        # Safety / efficiency
+        torque_penalty = -0.001 * jnp.mean(jnp.square(action))
+        contact_penalty = -0.0002 * jnp.mean(jnp.square(data.qfrc_constraint))
+        smoothness_penalty = -0.0005 * jnp.mean(jnp.square(action - prev_data.ctrl))
 
-        reward = upright_reward + torque_penalty + contact_penalty + alive
-        return reward
+        # Terminal shaping
+        fallen_penalty = jnp.where(torso_z < 0.05, -2.0, 0.0)
+        alive_bonus = jnp.where(torso_z > 0.08, 0.2, -0.2)
+
+        return (
+            1.0 * upright
+            + 0.6 * height_term
+            + linear_vel_penalty
+            + angular_vel_penalty
+            + torque_penalty
+            + contact_penalty
+            + smoothness_penalty
+            + fallen_penalty
+            + alive_bonus
+        )
 
     # ── termination ──────────────────────────────────────────────────
 
