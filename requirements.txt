@@ -1,0 +1,29 @@
+# ──────────────────────────────────────────────────────────────
+# OP3 SafeFall MJX – Python Dependencies
+# ──────────────────────────────────────────────────────────────
+
+# Core JAX / MJX
+jax[cuda12]
+jaxlib
+mujoco>=3.1.0
+mujoco-mjx
+
+# RL / Deep Learning (Flax + Optax)
+flax>=0.8
+optax>=0.2
+
+# Numerics
+numpy>=1.26
+
+# Logging
+wandb>=0.16
+
+# Rendering / video (optional)
+opencv-python>=4.9
+mediapy>=1.2
+moviepy>=2.0
+matplotlib>=3.8
+
+# Utilities
+tqdm>=4.66
+python-dotenv>=1.0

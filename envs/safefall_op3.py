@@ -1,0 +1,286 @@
+"""SafeFall OP3 Training Environment (MJX).
+
+Inspired by *SafeFall: Learning Protective Control for Humanoid Robots*.
+
+The robot is subject to random perturbations (pushes, slips, trips, …)
+and must learn **protective fall control** that minimises injury risk
+while maximising stability recovery.
+
+Design
+------
+* Fully functional JAX API: ``reset(model, rng) -> State`` / ``step(model, state, action, rng) -> State``.
+* Immutable ``State`` dataclass.
+* Compatible with ``jax.jit`` and ``jax.vmap`` for parallel simulation.
+
+Reward
+------
+``r = r_safety + r_stability``  (placeholder weights – tune via config).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+from typing import Tuple
+
+import jax
+import jax.numpy as jnp
+import mujoco
+import mujoco.mjx as mjx
+
+from utils.config import Config
+from utils.perturbations import (
+    PerturbationState,
+    apply_all_perturbations,
+    init_perturbation_state,
+)
+from utils.metrics import compute_peak_contact_force, compute_peak_torque
+
+
+# ── Environment state ────────────────────────────────────────────────
+
+
+@dataclasses.dataclass(frozen=True)
+class SafeFallState:
+    """Immutable environment state."""
+
+    obs: jnp.ndarray           # (obs_dim,)
+    reward: jnp.ndarray        # scalar
+    done: jnp.ndarray          # scalar bool-like float
+    mjx_data: mjx.Data         # MJX physics state
+    info: dict                 # auxiliary info dict
+    perturbation_state: PerturbationState
+    step_count: jnp.ndarray    # scalar int
+
+
+# ── Environment class ────────────────────────────────────────────────
+
+
+class SafeFallOP3Env:
+    """SafeFall-style MJX environment for the OP3 humanoid.
+
+    Instantiate once, then call the (jittable) ``reset`` / ``step``
+    methods.  Both methods take the MJX model as their first arg so
+    that domain-randomised models can be swapped in at reset time.
+    """
+
+    def __init__(self, config: Config, mj_model: mujoco.MjModel):
+        self.config = config
+        self.mj_model = mj_model
+
+        # Cache useful body / sensor indices
+        self.torso_body_idx = mj_model.body("body_link").id
+        self.l_foot_body_idx = mj_model.body("l_ank_roll_link").id
+        self.r_foot_body_idx = mj_model.body("r_ank_roll_link").id
+        self.foot_body_indices = (self.l_foot_body_idx, self.r_foot_body_idx)
+
+        # Sensor addresses
+        self._accel_adr = self._sensor_slice("torso_accel")
+        self._gyro_adr = self._sensor_slice("torso_gyro")
+        self._quat_adr = self._sensor_slice("torso_quat")
+        self._linvel_adr = self._sensor_slice("torso_linvel")
+        self._angvel_adr = self._sensor_slice("torso_angvel")
+
+        # Observation / action dims
+        # obs = joint_pos(20) + joint_vel(20) + accel(3) + gyro(3) + quat(4) + linvel(3) + angvel(3) + contact(~11)
+        # We fix obs_dim after a trial build:
+        self.num_joints = config.num_joints  # 20
+        self._obs_dim: int | None = None  # lazily determined
+
+    # ── helpers ───────────────────────────────────────────────────────
+
+    def _sensor_slice(self, name: str) -> Tuple[int, int]:
+        sid = self.mj_model.sensor(name).id
+        adr = int(self.mj_model.sensor_adr[sid])
+        dim = int(self.mj_model.sensor_dim[sid])
+        return (adr, adr + dim)
+
+    @property
+    def obs_dim(self) -> int:
+        if self._obs_dim is None:
+            # joint_pos(20) + joint_vel(20) + accel(3) + gyro(3) + quat(4) + linvel(3) + angvel(3)
+            self._obs_dim = 20 + 20 + 3 + 3 + 4 + 3 + 3  # = 56
+        return self._obs_dim
+
+    @property
+    def action_dim(self) -> int:
+        return self.config.num_actions
+
+    # ── observation builder ──────────────────────────────────────────
+
+    def _build_obs(self, data: mjx.Data) -> jnp.ndarray:
+        """Construct observation vector from MJX data."""
+        joint_pos = data.qpos[7:]  # skip free-joint (7 DOFs)
+        joint_vel = data.qvel[6:]  # skip free-joint (6 DOFs)
+        sd = data.sensordata
+        accel = sd[self._accel_adr[0]:self._accel_adr[1]]
+        gyro = sd[self._gyro_adr[0]:self._gyro_adr[1]]
+        quat = sd[self._quat_adr[0]:self._quat_adr[1]]
+        linvel = sd[self._linvel_adr[0]:self._linvel_adr[1]]
+        angvel = sd[self._angvel_adr[0]:self._angvel_adr[1]]
+        return jnp.concatenate([joint_pos, joint_vel, accel, gyro, quat, linvel, angvel])
+
+    # ── reward (placeholder) ─────────────────────────────────────────
+
+    def _compute_reward(
+        self, data: mjx.Data, prev_data: mjx.Data, action: jnp.ndarray
+    ) -> jnp.ndarray:
+        """Compute ``r = r_safety + r_stability``.
+
+        TODO: Replace placeholder terms with proper SafeFall reward shaping.
+        """
+        # --- r_stability: reward for keeping torso upright ---
+        torso_z = data.qpos[2]  # height of base link
+        upright_reward = torso_z / 0.3  # normalised by nominal standing height
+
+        # --- r_safety: penalise large torques and contact forces ---
+        torque_penalty = -0.001 * jnp.sum(jnp.square(action))
+        contact_force = jnp.sum(jnp.abs(data.qfrc_constraint))
+        contact_penalty = -0.0001 * contact_force
+
+        # --- alive bonus ---
+        alive = jnp.where(torso_z > 0.05, 1.0, 0.0)
+
+        reward = upright_reward + torque_penalty + contact_penalty + alive
+        return reward
+
+    # ── termination ──────────────────────────────────────────────────
+
+    def _check_termination(
+        self, data: mjx.Data, step_count: jnp.ndarray
+    ) -> jnp.ndarray:
+        """Shared termination conditions."""
+        torso_z = data.qpos[2]
+
+        # Robot fully on the ground (fallen and stabilised)
+        fallen = torso_z < 0.05
+
+        # Time limit
+        timeout = step_count >= self.config.episode_max_steps
+
+        # Out of bounds
+        xy = data.qpos[0:2]
+        out_of_bounds = jnp.any(jnp.abs(xy) > 5.0)
+
+        # Numerical instability
+        nan_detected = jnp.any(jnp.isnan(data.qpos)) | jnp.any(jnp.isnan(data.qvel))
+
+        done = jnp.any(jnp.array([fallen, timeout, out_of_bounds, nan_detected]))
+        return done.astype(jnp.float32)
+
+    # ── reset ────────────────────────────────────────────────────────
+
+    def reset(self, mjx_model: mjx.Model, rng: jax.Array) -> SafeFallState:
+        """Reset the environment. Pure-functional, jittable.
+
+        Args:
+            mjx_model: (possibly domain-randomised) MJX model.
+            rng: JAX PRNG key.
+
+        Returns:
+            Initial ``SafeFallState``.
+        """
+        rng, rng_perturb = jax.random.split(rng)
+        data = mjx.make_data(mjx_model)
+        # Forward-simulate one step to settle initial state
+        data = mjx.step(mjx_model, data)
+
+        obs = self._build_obs(data)
+        perturb_state = init_perturbation_state(
+            self.config.num_actions, self.config.perturb_motor_delay_steps, rng_perturb
+        )
+        return SafeFallState(
+            obs=obs,
+            reward=jnp.float32(0.0),
+            done=jnp.float32(0.0),
+            mjx_data=data,
+            info={
+                "episode_reward": jnp.float32(0.0),
+                "peak_torque": jnp.float32(0.0),
+                "peak_contact_force": jnp.float32(0.0),
+            },
+            perturbation_state=perturb_state,
+            step_count=jnp.int32(0),
+        )
+
+    # ── step ─────────────────────────────────────────────────────────
+
+    def step(
+        self,
+        mjx_model: mjx.Model,
+        state: SafeFallState,
+        action: jnp.ndarray,
+        rng: jax.Array,
+    ) -> SafeFallState:
+        """Take one environment step. Pure-functional, jittable.
+
+        Args:
+            mjx_model: MJX model.
+            state: current state.
+            action: (num_actions,) action vector.
+            rng: PRNG key.
+
+        Returns:
+            Next ``SafeFallState``.
+        """
+        data = state.mjx_data
+
+        # Apply perturbations
+        qpos, qvel, xfrc, obs, delayed_action, new_perturb = apply_all_perturbations(
+            data.qpos, data.qvel, data.xfrc_applied, state.obs, action,
+            state.perturbation_state, rng,
+            torso_body_index=self.torso_body_idx,
+            foot_body_indices=self.foot_body_indices,
+            push_prob=self.config.perturb_external_push_prob,
+            push_force_range=self.config.perturb_external_push_force_range,
+            slip_prob=self.config.perturb_foot_slip_prob,
+            slip_vel_range=self.config.perturb_foot_slip_vel_range,
+            trip_prob=self.config.perturb_foot_trip_prob,
+            joint_noise_std=self.config.perturb_joint_noise_std,
+            motor_delay_steps=self.config.perturb_motor_delay_steps,
+            sensor_noise_std=self.config.perturb_sensor_noise_std,
+        )
+
+        # Update data with perturbed values
+        data = data.replace(
+            qpos=qpos,
+            qvel=qvel,
+            xfrc_applied=xfrc,
+            ctrl=jnp.clip(delayed_action, -1.0, 1.0),
+        )
+
+        # Physics step (multiple sub-steps for control_dt)
+        def _physics_substep(data_i, _):
+            return mjx.step(mjx_model, data_i), None
+
+        next_data, _ = jax.lax.scan(
+            _physics_substep, data, None,
+            length=self.config.physics_steps_per_control,
+        )
+
+        # Observation & reward
+        new_obs = self._build_obs(next_data)
+        reward = self._compute_reward(next_data, state.mjx_data, delayed_action)
+        new_step = state.step_count + 1
+        done = self._check_termination(next_data, new_step)
+
+        # Metrics
+        pt = jnp.maximum(state.info["peak_torque"], compute_peak_torque(delayed_action))
+        pcf_raw = jnp.sum(jnp.abs(next_data.qfrc_constraint))
+        pcf = jnp.maximum(state.info["peak_contact_force"], pcf_raw)
+
+        info = {
+            "episode_reward": state.info["episode_reward"] + reward,
+            "peak_torque": pt,
+            "peak_contact_force": pcf,
+        }
+
+        return SafeFallState(
+            obs=new_obs,
+            reward=reward,
+            done=done,
+            mjx_data=next_data,
+            info=info,
+            perturbation_state=new_perturb,
+            step_count=new_step,
+        )
