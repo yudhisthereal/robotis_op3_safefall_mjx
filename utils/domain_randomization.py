@@ -25,6 +25,9 @@ def randomize_model(
     damping_range: Tuple[float, float] = (0.7, 1.3),
     friction_range: Tuple[float, float] = (0.5, 1.5),
     ground_friction_range: Tuple[float, float] = (0.4, 1.6),
+    sensor_noise_scale_range: Tuple[float, float] = (0.5, 2.0),
+    contact_solref_scale_range: Tuple[float, float] = (0.8, 1.2),
+    contact_solimp_scale_range: Tuple[float, float] = (0.9, 1.1),
 ) -> mjx.Model:
     """Return a new MJX model with randomised physical parameters.
 
@@ -43,7 +46,7 @@ def randomize_model(
     Returns:
         A new ``mjx.Model`` with randomised parameters.
     """
-    rng_mass, rng_damp, rng_fric, rng_gfric = jax.random.split(rng, 4)
+    rng_mass, rng_damp, rng_fric, rng_gfric, rng_sensor, rng_solref, rng_solimp = jax.random.split(rng, 7)
 
     # ── Body masses ──────────────────────────────────────────────────
     mass_scale = jax.random.uniform(
@@ -83,11 +86,60 @@ def randomize_model(
     new_friction = new_friction.at[0].set(model.geom_friction[0] * gfric_scale)
 
     # ── Assemble new model ───────────────────────────────────────────
-    new_model = model.replace(
+    replace_kwargs = dict(
         body_mass=new_mass,
         dof_damping=new_damping,
         geom_friction=new_friction,
     )
+
+    # Sensor noise scales (if available in this MJX model version)
+    if hasattr(model, "sensor_noise"):
+        sns_scale = jax.random.uniform(
+            rng_sensor,
+            shape=model.sensor_noise.shape,
+            minval=sensor_noise_scale_range[0],
+            maxval=sensor_noise_scale_range[1],
+        )
+        replace_kwargs["sensor_noise"] = model.sensor_noise * sns_scale
+
+    # Contact parameters (if available)
+    if hasattr(model, "geom_solref"):
+        solref_scale = jax.random.uniform(
+            rng_solref,
+            shape=model.geom_solref.shape,
+            minval=contact_solref_scale_range[0],
+            maxval=contact_solref_scale_range[1],
+        )
+        replace_kwargs["geom_solref"] = model.geom_solref * solref_scale
+
+    if hasattr(model, "pair_solref"):
+        pair_solref_scale = jax.random.uniform(
+            rng_solref,
+            shape=model.pair_solref.shape,
+            minval=contact_solref_scale_range[0],
+            maxval=contact_solref_scale_range[1],
+        )
+        replace_kwargs["pair_solref"] = model.pair_solref * pair_solref_scale
+
+    if hasattr(model, "geom_solimp"):
+        solimp_scale = jax.random.uniform(
+            rng_solimp,
+            shape=model.geom_solimp.shape,
+            minval=contact_solimp_scale_range[0],
+            maxval=contact_solimp_scale_range[1],
+        )
+        replace_kwargs["geom_solimp"] = model.geom_solimp * solimp_scale
+
+    if hasattr(model, "pair_solimp"):
+        pair_solimp_scale = jax.random.uniform(
+            rng_solimp,
+            shape=model.pair_solimp.shape,
+            minval=contact_solimp_scale_range[0],
+            maxval=contact_solimp_scale_range[1],
+        )
+        replace_kwargs["pair_solimp"] = model.pair_solimp * pair_solimp_scale
+
+    new_model = model.replace(**replace_kwargs)
     return new_model
 
 

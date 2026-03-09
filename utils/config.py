@@ -108,6 +108,8 @@ class Config:
     dr_friction_range: Tuple[float, float] = (0.5, 1.5)
     dr_sensor_noise_scale_range: Tuple[float, float] = (0.5, 2.0)
     dr_ground_friction_range: Tuple[float, float] = (0.4, 1.6)
+    dr_contact_solref_scale_range: Tuple[float, float] = (0.8, 1.2)
+    dr_contact_solimp_scale_range: Tuple[float, float] = (0.9, 1.1)
 
     # ── Derived helpers ──────────────────────────────────────────────
     @property

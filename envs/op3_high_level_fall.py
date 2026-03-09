@@ -34,8 +34,10 @@ import mujoco.mjx as mjx
 
 from envs.op3_low_level_fall import NUM_STRATEGIES
 from utils.config import Config
+from utils.domain_randomization import randomize_model
 from utils.perturbations import (
     PerturbationState,
+    apply_all_perturbations,
     init_perturbation_state,
 )
 
@@ -48,6 +50,7 @@ class HighLevelFallState:
     obs: jnp.ndarray
     reward: jnp.ndarray
     done: jnp.ndarray
+    mjx_model: mjx.Model
     mjx_data: mjx.Data
     info: dict
     perturbation_state: PerturbationState
@@ -70,9 +73,11 @@ class OP3HighLevelFallEnv:
         self,
         config: Config,
         mj_model: mujoco.MjModel,
+        mjx_model: mjx.Model,
     ):
         self.config = config
         self.mj_model = mj_model
+        self.mjx_model = mjx_model
 
         self.torso_body_idx = mj_model.body("body_link").id
         self.l_foot_body_idx = mj_model.body("l_ank_roll_link").id
@@ -183,10 +188,21 @@ class OP3HighLevelFallEnv:
 
     # ── reset ────────────────────────────────────────────────────────
 
-    def reset(self, mjx_model: mjx.Model, rng: jax.Array) -> HighLevelFallState:
-        rng, rng_perturb = jax.random.split(rng)
-        data = mjx.make_data(mjx_model)
-        data = mjx.step(mjx_model, data)
+    def reset(self, rng: jax.Array) -> HighLevelFallState:
+        rng, rng_dr, rng_perturb = jax.random.split(rng, 3)
+        model = randomize_model(
+            self.mjx_model,
+            rng_dr,
+            mass_range=self.config.dr_mass_range,
+            damping_range=self.config.dr_damping_range,
+            friction_range=self.config.dr_friction_range,
+            ground_friction_range=self.config.dr_ground_friction_range,
+            sensor_noise_scale_range=self.config.dr_sensor_noise_scale_range,
+            contact_solref_scale_range=self.config.dr_contact_solref_scale_range,
+            contact_solimp_scale_range=self.config.dr_contact_solimp_scale_range,
+        )
+        data = mjx.make_data(model)
+        data = mjx.step(model, data)
         obs = self._build_obs(data)
         ps = init_perturbation_state(
             self.config.num_actions, self.config.perturb_motor_delay_steps, rng_perturb,
@@ -195,6 +211,7 @@ class OP3HighLevelFallEnv:
             obs=obs,
             reward=jnp.float32(0.0),
             done=jnp.float32(0.0),
+            mjx_model=model,
             mjx_data=data,
             info={
                 "episode_reward": jnp.float32(0.0),
@@ -210,7 +227,6 @@ class OP3HighLevelFallEnv:
 
     def step(
         self,
-        mjx_model: mjx.Model,
         state: HighLevelFallState,
         action: jnp.ndarray,
         rng: jax.Array,
@@ -220,8 +236,29 @@ class OP3HighLevelFallEnv:
         strategy_idx = jnp.argmax(action[:NUM_STRATEGIES])
 
         data = state.mjx_data
+        mjx_model = state.mjx_model
         low_level_action = self._strategy_to_action(strategy_idx)
-        data = data.replace(ctrl=jnp.clip(low_level_action, -1.0, 1.0))
+
+        qpos, qvel, xfrc, _obs_noisy, delayed_action, new_ps = apply_all_perturbations(
+            data.qpos, data.qvel, data.xfrc_applied, state.obs, low_level_action,
+            state.perturbation_state, rng,
+            torso_body_index=self.torso_body_idx,
+            foot_body_indices=self.foot_body_indices,
+            push_prob=self.config.perturb_external_push_prob,
+            push_force_range=self.config.perturb_external_push_force_range,
+            slip_prob=self.config.perturb_foot_slip_prob,
+            slip_vel_range=self.config.perturb_foot_slip_vel_range,
+            trip_prob=self.config.perturb_foot_trip_prob,
+            joint_noise_std=self.config.perturb_joint_noise_std,
+            motor_delay_steps=self.config.perturb_motor_delay_steps,
+            sensor_noise_std=self.config.perturb_sensor_noise_std,
+        )
+        data = data.replace(
+            qpos=qpos,
+            qvel=qvel,
+            xfrc_applied=xfrc,
+            ctrl=jnp.clip(delayed_action, -1.0, 1.0),
+        )
 
         def _substep(d, _):
             return mjx.step(mjx_model, d), None
@@ -242,7 +279,7 @@ class OP3HighLevelFallEnv:
 
         info = {
             "episode_reward": state.info["episode_reward"] + reward,
-            "peak_torque": jnp.maximum(state.info["peak_torque"], jnp.max(jnp.abs(low_level_action))),
+            "peak_torque": jnp.maximum(state.info["peak_torque"], jnp.max(jnp.abs(delayed_action))),
             "peak_contact_force": jnp.maximum(
                 state.info["peak_contact_force"],
                 jnp.sum(jnp.abs(next_data.qfrc_constraint)),
@@ -253,9 +290,10 @@ class OP3HighLevelFallEnv:
             obs=obs,
             reward=reward,
             done=done,
+            mjx_model=mjx_model,
             mjx_data=next_data,
             info=info,
-            perturbation_state=state.perturbation_state,
+            perturbation_state=new_ps,
             step_count=new_step,
             selected_strategy=strategy_idx,
         )

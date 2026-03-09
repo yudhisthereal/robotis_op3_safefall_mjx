@@ -106,12 +106,12 @@ def vectorize_env(
 
     Assumes signatures::
 
-        reset(mjx_model, rng) -> state
-        step(mjx_model, state, action, rng) -> state
+        reset(rng) -> state
+        step(state, action, rng) -> state
 
     Returns:
         (v_reset, v_step) – vmapped versions.
     """
-    v_reset = jax.vmap(reset_fn, in_axes=(None, 0))
-    v_step = jax.vmap(step_fn, in_axes=(None, 0, 0, 0))
+    v_reset = jax.vmap(reset_fn, in_axes=(0,))
+    v_step = jax.vmap(step_fn, in_axes=(0, 0, 0))
     return v_reset, v_step

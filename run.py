@@ -33,7 +33,6 @@ jax.config.update("jax_default_matmul_precision", "float32")
 import wandb
 
 from utils.config import Config, make_config
-from utils.domain_randomization import batch_randomize_model
 from utils.env import load_mjx_model
 from utils.checkpoint import save_checkpoint, BestModelTracker
 from utils.evaluator import evaluate
@@ -119,7 +118,7 @@ def main():
 
     # ── Environment ──────────────────────────────────────────────────
     EnvClass = ENV_REGISTRY[config.env_name]
-    env = EnvClass(config, mj_model)
+    env = EnvClass(config, mj_model, mjx_model)
     obs_dim = env.obs_dim
     action_dim = env.action_dim
     print(f"[run.py] obs_dim={obs_dim}, action_dim={action_dim}")
@@ -131,20 +130,8 @@ def main():
     print(f"[run.py] PPO agent initialised.")
 
     # ── Vectorised env functions ─────────────────────────────────────
-    # Domain randomization produces one model per environment.
-    v_reset = jax.jit(jax.vmap(env.reset, in_axes=(0, 0)))
-    v_step = jax.jit(jax.vmap(env.step, in_axes=(0, 0, 0, 0)))
-
-    def randomize_models(rng_key: jax.Array) -> jax.Array:
-        return batch_randomize_model(
-            mjx_model,
-            rng_key,
-            config.num_envs,
-            mass_range=config.dr_mass_range,
-            damping_range=config.dr_damping_range,
-            friction_range=config.dr_friction_range,
-            ground_friction_range=config.dr_ground_friction_range,
-        )
+    v_reset = jax.jit(jax.vmap(env.reset, in_axes=(0,)))
+    v_step = jax.jit(jax.vmap(env.step, in_axes=(0, 0, 0)))
 
     # ── WandB ────────────────────────────────────────────────────────
     wandb.init(
@@ -173,102 +160,147 @@ def main():
         print("[run.py] Render worker started.")
 
     # ── Training loop ────────────────────────────────────────────────
-    rng, rng_reset, rng_dr = jax.random.split(train_state.rng, 3)
+    rng, rng_reset = jax.random.split(train_state.rng)
     env_keys = jax.random.split(rng_reset, config.num_envs)
-    env_models = randomize_models(rng_dr)
-    states = v_reset(env_models, env_keys)
+    states = v_reset(env_keys)
 
     global_step = 0
     global_episode = 0
     reward_history: deque = deque(maxlen=config.plateau_window_episodes)
+    length_history: deque = deque(maxlen=config.plateau_window_episodes)
+    peak_torque_history: deque = deque(maxlen=config.plateau_window_episodes)
+    peak_contact_history: deque = deque(maxlen=config.plateau_window_episodes)
     update_count = 0
 
     print("[run.py] Starting training loop …")
     t_start = time.time()
 
-    try:
-        while True:
-            # ── Collect rollout ──────────────────────────────────────
-            goal_dim = int(states.goal.shape[-1]) if hasattr(states, "goal") else 0
-            buffer = RolloutBuffer.create(
-                config.num_envs, config.rollout_length, obs_dim, action_dim, goal_dim=goal_dim,
+    has_goal = hasattr(states, "goal")
+    goal_dim = int(states.goal.shape[-1]) if has_goal else 0
+
+    @jax.jit
+    def _train_iteration(train_state, states, rng):
+        buffer = RolloutBuffer.create(
+            config.num_envs,
+            config.rollout_length,
+            obs_dim,
+            action_dim,
+            goal_dim=goal_dim,
+        )
+        rollout_keys = jax.random.split(rng, config.rollout_length + 1)
+        next_rng = rollout_keys[0]
+        step_keys = rollout_keys[1:]
+
+        episode_rewards_accum = jnp.zeros(config.num_envs)
+        episode_lengths_accum = jnp.zeros(config.num_envs, dtype=jnp.int32)
+        peak_torques_accum = jnp.zeros(config.num_envs)
+        peak_cforces_accum = jnp.zeros(config.num_envs)
+
+        def _scan_step(carry, xs):
+            t, key = xs
+            cur_states, cur_buffer, ep_rew, ep_len, ep_pt, ep_pcf = carry
+
+            key_act, key_env, key_reset = jax.random.split(key, 3)
+            obs = cur_states.obs
+            actions, log_probs = agent.get_action(train_state.params, obs, key_act)
+            values = agent.get_value(train_state.params, obs)
+
+            env_step_keys = jax.random.split(key_env, config.num_envs)
+            next_states = v_step(cur_states, actions, env_step_keys)
+
+            goals = cur_states.goal if has_goal else None
+            cur_buffer = cur_buffer.store(
+                t,
+                obs,
+                actions,
+                next_states.reward,
+                values,
+                log_probs,
+                next_states.done,
+                goals=goals,
             )
 
-            rng, rng_rollout = jax.random.split(rng)
-            rollout_keys = jax.random.split(rng_rollout, config.rollout_length)
+            ep_rew = ep_rew + next_states.reward
+            ep_len = ep_len + 1
+            ep_pt = jnp.maximum(ep_pt, batch_peak_torque(actions))
+            ep_pcf = jnp.maximum(
+                ep_pcf,
+                jnp.sum(jnp.abs(next_states.mjx_data.qfrc_constraint), axis=-1),
+            )
 
-            episode_rewards_accum = jnp.zeros(config.num_envs)
-            episode_lengths_accum = jnp.zeros(config.num_envs, dtype=jnp.int32)
-            peak_torques_accum = jnp.zeros(config.num_envs)
-            peak_cforces_accum = jnp.zeros(config.num_envs)
+            done_mask = next_states.done > 0.5
+            finished_rewards = jnp.where(done_mask, ep_rew, 0.0)
+            finished_lengths = jnp.where(done_mask, ep_len, 0)
+            finished_peak_torque = jnp.where(done_mask, ep_pt, 0.0)
+            finished_peak_cforce = jnp.where(done_mask, ep_pcf, 0.0)
 
-            for t in range(config.rollout_length):
-                obs = states.obs
-                rng_act = rollout_keys[t]
+            reset_keys = jax.random.split(key_reset, config.num_envs)
+            fresh_states = v_reset(reset_keys)
+            merged_states = jax.tree.map(
+                lambda fresh, cont: jnp.where(
+                    done_mask.reshape((-1,) + (1,) * (fresh.ndim - 1)), fresh, cont
+                ),
+                fresh_states,
+                next_states,
+            )
 
-                # Get actions and values
-                actions, log_probs = agent.get_action(train_state.params, obs, rng_act)
-                values = agent.get_value(train_state.params, obs)
+            ep_rew = jnp.where(done_mask, 0.0, ep_rew)
+            ep_len = jnp.where(done_mask, 0, ep_len)
+            ep_pt = jnp.where(done_mask, 0.0, ep_pt)
+            ep_pcf = jnp.where(done_mask, 0.0, ep_pcf)
 
-                # Step environments
-                step_keys = jax.random.split(rollout_keys[t], config.num_envs)
-                next_states = v_step(env_models, states, actions, step_keys)
+            new_carry = (merged_states, cur_buffer, ep_rew, ep_len, ep_pt, ep_pcf)
+            out = (
+                done_mask,
+                finished_rewards,
+                finished_lengths,
+                finished_peak_torque,
+                finished_peak_cforce,
+            )
+            return new_carry, out
 
-                # Store transition
-                goals = states.goal if hasattr(states, "goal") else None
-                buffer = buffer.store(
-                    t, obs, actions, next_states.reward, values, log_probs, next_states.done, goals=goals,
-                )
+        t_idx = jnp.arange(config.rollout_length, dtype=jnp.int32)
+        (states, buffer, _, _, _, _), rollout_out = jax.lax.scan(
+            _scan_step,
+            (states, buffer, episode_rewards_accum, episode_lengths_accum, peak_torques_accum, peak_cforces_accum),
+            (t_idx, step_keys),
+        )
 
-                # Track per-env metrics
-                episode_rewards_accum = episode_rewards_accum + next_states.reward
-                episode_lengths_accum = episode_lengths_accum + 1
-                peak_torques_accum = jnp.maximum(peak_torques_accum, batch_peak_torque(actions))
+        done_mask_t, finished_rewards_t, finished_lengths_t, finished_pt_t, finished_pcf_t = rollout_out
+        total_done = jnp.sum(done_mask_t.astype(jnp.int32))
 
-                # Auto-reset done environments
-                rng, rng_autoreset = jax.random.split(rng)
-                done_mask = next_states.done > 0.5
-                any_done = jnp.any(done_mask)
+        last_values = agent.get_value(train_state.params, states.obs)
+        train_state, update_metrics = agent.update(train_state, buffer, last_values)
 
-                # Count completed episodes
-                n_done = jnp.sum(done_mask).astype(jnp.int32)
-                global_episode += int(n_done)
+        stats = {
+            "done_mask_t": done_mask_t,
+            "finished_rewards_t": finished_rewards_t,
+            "finished_lengths_t": finished_lengths_t,
+            "finished_pt_t": finished_pt_t,
+            "finished_pcf_t": finished_pcf_t,
+            "num_finished": total_done,
+        }
+        return train_state, states, next_rng, update_metrics, stats
 
-                # Record finished episode rewards
-                if int(any_done):
-                    finished_rewards = jnp.where(done_mask, episode_rewards_accum, 0.0)
-                    for r in finished_rewards[done_mask]:
-                        reward_history.append(float(r))
-                    # Reset accumulators for done envs
-                    episode_rewards_accum = jnp.where(done_mask, 0.0, episode_rewards_accum)
-                    episode_lengths_accum = jnp.where(done_mask, 0, episode_lengths_accum)
+    try:
+        while True:
+            train_state, states, rng, update_metrics, stats = _train_iteration(train_state, states, rng)
 
-                # Reset done environments
-                rng, rng_dr_reset = jax.random.split(rng)
-                reset_keys = jax.random.split(rng_autoreset, config.num_envs)
-                fresh_models = randomize_models(rng_dr_reset)
-                fresh_states = v_reset(fresh_models, reset_keys)
-                # Merge: use fresh state where done, keep next_state otherwise
-                states = jax.tree.map(
-                    lambda fresh, cont: jnp.where(
-                        done_mask.reshape((-1,) + (1,) * (fresh.ndim - 1)), fresh, cont
-                    ),
-                    fresh_states,
-                    next_states,
-                )
-                env_models = jax.tree.map(
-                    lambda fresh, cont: jnp.where(
-                        done_mask.reshape((-1,) + (1,) * (fresh.ndim - 1)), fresh, cont
-                    ),
-                    fresh_models,
-                    env_models,
-                )
+            global_step += config.num_envs * config.rollout_length
+            global_episode += int(stats["num_finished"])
 
-                global_step += config.num_envs
+            done_mask_np = np.asarray(stats["done_mask_t"])
+            rew_np = np.asarray(stats["finished_rewards_t"])
+            len_np = np.asarray(stats["finished_lengths_t"])
+            pt_np = np.asarray(stats["finished_pt_t"])
+            pcf_np = np.asarray(stats["finished_pcf_t"])
 
-            # ── PPO update ───────────────────────────────────────────
-            last_values = agent.get_value(train_state.params, states.obs)
-            train_state, update_metrics = agent.update(train_state, buffer, last_values)
+            if done_mask_np.any():
+                reward_history.extend(rew_np[done_mask_np].tolist())
+                length_history.extend(len_np[done_mask_np].astype(np.float32).tolist())
+                peak_torque_history.extend(pt_np[done_mask_np].tolist())
+                peak_contact_history.extend(pcf_np[done_mask_np].tolist())
+
             update_count += 1
 
             # ── Logging ──────────────────────────────────────────────
@@ -276,13 +308,19 @@ def main():
                 elapsed = time.time() - t_start
                 sps = global_step / max(elapsed, 1e-6)
                 mean_reward = float(np.mean(list(reward_history))) if reward_history else 0.0
+                mean_length = float(np.mean(list(length_history))) if length_history else 0.0
+                mean_peak_torque = float(np.mean(list(peak_torque_history))) if peak_torque_history else 0.0
+                mean_peak_contact = float(np.mean(list(peak_contact_history))) if peak_contact_history else 0.0
 
                 log_data = {
                     "episode_reward": mean_reward,
+                    "episode_length": mean_length,
                     "policy_loss": float(update_metrics["policy_loss"]),
                     "value_loss": float(update_metrics["value_loss"]),
                     "entropy": float(update_metrics["entropy"]),
                     "learning_rate": float(update_metrics["learning_rate"]),
+                    "peak_torque": mean_peak_torque,
+                    "peak_contact_force": mean_peak_contact,
                     "global_step": global_step,
                     "global_episode": global_episode,
                     "sps": sps,
@@ -305,7 +343,6 @@ def main():
                     params=train_state.params["policy"],
                     reset_fn=env.reset,
                     step_fn=env.step,
-                    mjx_model=mjx_model,
                     rng=rng_eval,
                     config=config,
                     num_eval_episodes=config.num_eval_episodes,

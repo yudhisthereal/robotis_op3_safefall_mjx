@@ -23,19 +23,19 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # ── Run ──────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  OP3 SafeFall MJX Training                              ║"
+echo "║  OP3 SafeFall MJX Training                               ║"
 echo "╠══════════════════════════════════════════════════════════╣"
-echo "║  Env          : ${ENV}"
-echo "║  Num envs     : ${NUM_ENVS}"
-echo "║  Device       : ${DEVICE}"
-echo "║  Seed         : ${SEED}"
-echo "║  LR           : ${LR}"
-echo "║  Rollout len  : ${ROLLOUT}"
-echo "║  Update epochs: ${UPDATE_EPOCHS}"
-echo "║  Minibatches  : ${NUM_MB}"
+echo "║  Env          : ${ENV}                                   ║"
+echo "║  Num envs     : ${NUM_ENVS}                              ║"
+echo "║  Device       : ${DEVICE}                                ║"
+echo "║  Seed         : ${SEED}                                  ║"
+echo "║  LR           : ${LR}                                    ║"
+echo "║  Rollout len  : ${ROLLOUT}                               ║"
+echo "║  Update epochs: ${UPDATE_EPOCHS}                         ║"
+echo "║  Minibatches  : ${NUM_MB}                                ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 
-python run.py \
+home/yudhis/venv/gym-env/bin/python run.py \
     --env "${ENV}" \
     --num_envs "${NUM_ENVS}" \
     --device "${DEVICE}" \

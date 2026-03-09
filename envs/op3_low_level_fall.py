@@ -28,6 +28,7 @@ import mujoco
 import mujoco.mjx as mjx
 
 from utils.config import Config
+from utils.domain_randomization import randomize_model
 from utils.perturbations import (
     PerturbationState,
     apply_all_perturbations,
@@ -49,6 +50,7 @@ class LowLevelFallState:
     obs: jnp.ndarray
     reward: jnp.ndarray
     done: jnp.ndarray
+    mjx_model: mjx.Model
     mjx_data: mjx.Data
     info: dict
     perturbation_state: PerturbationState
@@ -66,9 +68,10 @@ class OP3LowLevelFallEnv:
     episode.  The policy must learn to execute the specified strategy.
     """
 
-    def __init__(self, config: Config, mj_model: mujoco.MjModel):
+    def __init__(self, config: Config, mj_model: mujoco.MjModel, mjx_model: mjx.Model):
         self.config = config
         self.mj_model = mj_model
+        self.mjx_model = mjx_model
 
         self.torso_body_idx = mj_model.body("body_link").id
         self.l_foot_body_idx = mj_model.body("l_ank_roll_link").id
@@ -214,10 +217,21 @@ class OP3LowLevelFallEnv:
 
     # ── reset ────────────────────────────────────────────────────────
 
-    def reset(self, mjx_model: mjx.Model, rng: jax.Array) -> LowLevelFallState:
-        rng, rng_goal, rng_perturb = jax.random.split(rng, 3)
-        data = mjx.make_data(mjx_model)
-        data = mjx.step(mjx_model, data)
+    def reset(self, rng: jax.Array) -> LowLevelFallState:
+        rng, rng_dr, rng_goal, rng_perturb = jax.random.split(rng, 4)
+        model = randomize_model(
+            self.mjx_model,
+            rng_dr,
+            mass_range=self.config.dr_mass_range,
+            damping_range=self.config.dr_damping_range,
+            friction_range=self.config.dr_friction_range,
+            ground_friction_range=self.config.dr_ground_friction_range,
+            sensor_noise_scale_range=self.config.dr_sensor_noise_scale_range,
+            contact_solref_scale_range=self.config.dr_contact_solref_scale_range,
+            contact_solimp_scale_range=self.config.dr_contact_solimp_scale_range,
+        )
+        data = mjx.make_data(model)
+        data = mjx.step(model, data)
 
         # Sample a random strategy (one-hot goal)
         strategy_idx = jax.random.randint(rng_goal, (), 0, NUM_STRATEGIES)
@@ -230,6 +244,7 @@ class OP3LowLevelFallEnv:
             obs=obs,
             reward=jnp.float32(0.0),
             done=jnp.float32(0.0),
+            mjx_model=model,
             mjx_data=data,
             info={"episode_reward": jnp.float32(0.0), "peak_torque": jnp.float32(0.0), "peak_contact_force": jnp.float32(0.0)},
             perturbation_state=ps,
@@ -240,9 +255,10 @@ class OP3LowLevelFallEnv:
     # ── step ─────────────────────────────────────────────────────────
 
     def step(
-        self, mjx_model: mjx.Model, state: LowLevelFallState, action: jnp.ndarray, rng: jax.Array
+        self, state: LowLevelFallState, action: jnp.ndarray, rng: jax.Array
     ) -> LowLevelFallState:
         data = state.mjx_data
+        mjx_model = state.mjx_model
 
         qpos, qvel, xfrc, obs_noisy, delayed_action, new_ps = apply_all_perturbations(
             data.qpos, data.qvel, data.xfrc_applied, state.obs, action,
@@ -277,5 +293,5 @@ class OP3LowLevelFallEnv:
 
         return LowLevelFallState(
             obs=new_obs, reward=reward, done=done, mjx_data=next_data,
-            info=info, perturbation_state=new_ps, step_count=new_step, goal=state.goal,
+            mjx_model=mjx_model, info=info, perturbation_state=new_ps, step_count=new_step, goal=state.goal,
         )

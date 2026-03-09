@@ -29,7 +29,7 @@ def _render_loop(
     num_actions: int,
     episode_max_steps: int,
     hidden_sizes: tuple = (512, 256, 128),
-    obs_dim: int = 67,
+    obs_dim: int = 56,
     headless: bool = False,
 ):
     """Main loop executed in the render worker process.
@@ -144,7 +144,7 @@ def start_render_worker(
     scene_xml_path: str,
     num_actions: int = 20,
     episode_max_steps: int = 1000,
-    obs_dim: int = 67,
+    obs_dim: int = 56,
     hidden_sizes: tuple = (512, 256, 128),
     headless: bool = False,
 ) -> tuple:

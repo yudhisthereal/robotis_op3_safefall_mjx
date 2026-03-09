@@ -19,7 +19,6 @@ def evaluate(
     params: Any,
     reset_fn: Callable,
     step_fn: Callable,
-    mjx_model: Any,
     rng: jax.Array,
     config: Config,
     num_eval_episodes: int = 16,
@@ -29,9 +28,8 @@ def evaluate(
     Args:
         policy_apply_fn: ``apply(params, obs) -> (mean, log_std)``.
         params: network parameter tree.
-        reset_fn: **single-env** ``reset(model, rng) -> state``.
-        step_fn: **single-env** ``step(model, state, action, rng) -> state``.
-        mjx_model: MJX model (single, not batched).
+        reset_fn: **single-env** ``reset(rng) -> state``.
+        step_fn: **single-env** ``step(state, action, rng) -> state``.
         rng: JAX PRNG key.
         config: project configuration.
         num_eval_episodes: how many episodes to run.
@@ -42,7 +40,7 @@ def evaluate(
 
     def _run_one_episode(rng: jax.Array) -> Tuple[float, int, bool]:
         rng_reset, rng_step = jax.random.split(rng)
-        state = reset_fn(mjx_model, rng_reset)
+        state = reset_fn(rng_reset)
 
         def _step_fn(carry, _):
             state, rng, total_reward, length, done_flag = carry
@@ -52,7 +50,7 @@ def evaluate(
             mean, _log_std = policy_apply_fn(params, state.obs)
             action = mean  # deterministic
 
-            next_state = step_fn(mjx_model, state, action, rng_env)
+            next_state = step_fn(state, action, rng_env)
 
             # Only accumulate reward while not done
             still_alive = 1.0 - done_flag

@@ -29,6 +29,7 @@ import mujoco
 import mujoco.mjx as mjx
 
 from utils.config import Config
+from utils.domain_randomization import randomize_model
 from utils.perturbations import (
     PerturbationState,
     apply_all_perturbations,
@@ -47,6 +48,7 @@ class SafeFallState:
     obs: jnp.ndarray           # (obs_dim,)
     reward: jnp.ndarray        # scalar
     done: jnp.ndarray          # scalar bool-like float
+    mjx_model: mjx.Model       # per-env randomized MJX model
     mjx_data: mjx.Data         # MJX physics state
     info: dict                 # auxiliary info dict
     perturbation_state: PerturbationState
@@ -64,9 +66,10 @@ class SafeFallOP3Env:
     that domain-randomised models can be swapped in at reset time.
     """
 
-    def __init__(self, config: Config, mj_model: mujoco.MjModel):
+    def __init__(self, config: Config, mj_model: mujoco.MjModel, mjx_model: mjx.Model):
         self.config = config
         self.mj_model = mj_model
+        self.mjx_model = mjx_model
 
         # Cache useful body / sensor indices
         self.torso_body_idx = mj_model.body("body_link").id
@@ -185,7 +188,7 @@ class SafeFallOP3Env:
 
     # ── reset ────────────────────────────────────────────────────────
 
-    def reset(self, mjx_model: mjx.Model, rng: jax.Array) -> SafeFallState:
+    def reset(self, rng: jax.Array) -> SafeFallState:
         """Reset the environment. Pure-functional, jittable.
 
         Args:
@@ -195,10 +198,21 @@ class SafeFallOP3Env:
         Returns:
             Initial ``SafeFallState``.
         """
-        rng, rng_perturb = jax.random.split(rng)
-        data = mjx.make_data(mjx_model)
+        rng, rng_dr, rng_perturb = jax.random.split(rng, 3)
+        model = randomize_model(
+            self.mjx_model,
+            rng_dr,
+            mass_range=self.config.dr_mass_range,
+            damping_range=self.config.dr_damping_range,
+            friction_range=self.config.dr_friction_range,
+            ground_friction_range=self.config.dr_ground_friction_range,
+            sensor_noise_scale_range=self.config.dr_sensor_noise_scale_range,
+            contact_solref_scale_range=self.config.dr_contact_solref_scale_range,
+            contact_solimp_scale_range=self.config.dr_contact_solimp_scale_range,
+        )
+        data = mjx.make_data(model)
         # Forward-simulate one step to settle initial state
-        data = mjx.step(mjx_model, data)
+        data = mjx.step(model, data)
 
         obs = self._build_obs(data)
         perturb_state = init_perturbation_state(
@@ -208,6 +222,7 @@ class SafeFallOP3Env:
             obs=obs,
             reward=jnp.float32(0.0),
             done=jnp.float32(0.0),
+            mjx_model=model,
             mjx_data=data,
             info={
                 "episode_reward": jnp.float32(0.0),
@@ -222,7 +237,6 @@ class SafeFallOP3Env:
 
     def step(
         self,
-        mjx_model: mjx.Model,
         state: SafeFallState,
         action: jnp.ndarray,
         rng: jax.Array,
@@ -239,6 +253,7 @@ class SafeFallOP3Env:
             Next ``SafeFallState``.
         """
         data = state.mjx_data
+        mjx_model = state.mjx_model
 
         # Apply perturbations
         qpos, qvel, xfrc, obs, delayed_action, new_perturb = apply_all_perturbations(
@@ -294,6 +309,7 @@ class SafeFallOP3Env:
             obs=new_obs,
             reward=reward,
             done=done,
+            mjx_model=mjx_model,
             mjx_data=next_data,
             info=info,
             perturbation_state=new_perturb,
