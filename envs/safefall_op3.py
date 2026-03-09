@@ -8,7 +8,7 @@ while maximising stability recovery.
 
 Design
 ------
-* Fully functional JAX API: ``reset(model, rng) -> State`` / ``step(model, state, action, rng) -> State``.
+* Fully functional JAX API: ``reset(rng) -> State`` / ``step(state, action, rng) -> State``.
 * Immutable ``State`` dataclass.
 * Compatible with ``jax.jit`` and ``jax.vmap`` for parallel simulation.
 
@@ -35,6 +35,7 @@ from utils.perturbations import (
     apply_all_perturbations,
     init_perturbation_state,
 )
+from utils.reset_fall_state import sample_falling_state
 from utils.metrics import compute_peak_contact_force, compute_peak_torque
 
 
@@ -48,6 +49,9 @@ class SafeFallState:
     obs: jnp.ndarray           # (obs_dim,)
     reward: jnp.ndarray        # scalar
     done: jnp.ndarray          # scalar bool-like float
+    qpos: jnp.ndarray          # explicit generalized positions
+    qvel: jnp.ndarray          # explicit generalized velocities
+    act: jnp.ndarray           # explicit applied action/control
     mjx_model: mjx.Model       # per-env randomized MJX model
     mjx_data: mjx.Data         # MJX physics state
     info: dict                 # auxiliary info dict
@@ -62,8 +66,7 @@ class SafeFallOP3Env:
     """SafeFall-style MJX environment for the OP3 humanoid.
 
     Instantiate once, then call the (jittable) ``reset`` / ``step``
-    methods.  Both methods take the MJX model as their first arg so
-    that domain-randomised models can be swapped in at reset time.
+    methods.
     """
 
     def __init__(self, config: Config, mj_model: mujoco.MjModel, mjx_model: mjx.Model):
@@ -211,6 +214,12 @@ class SafeFallOP3Env:
             contact_solimp_scale_range=self.config.dr_contact_solimp_scale_range,
         )
         data = mjx.make_data(model)
+
+        # Stochastic post-fall initial state (no fall predictor)
+        rng, rng_fall = jax.random.split(rng)
+        qpos_init, qvel_init = sample_falling_state(data.qpos, data.qvel, rng_fall)
+        data = data.replace(qpos=qpos_init, qvel=qvel_init)
+
         # Forward-simulate one step to settle initial state
         data = mjx.step(model, data)
 
@@ -222,6 +231,9 @@ class SafeFallOP3Env:
             obs=obs,
             reward=jnp.float32(0.0),
             done=jnp.float32(0.0),
+            qpos=data.qpos,
+            qvel=data.qvel,
+            act=data.ctrl,
             mjx_model=model,
             mjx_data=data,
             info={
@@ -309,6 +321,9 @@ class SafeFallOP3Env:
             obs=new_obs,
             reward=reward,
             done=done,
+            qpos=next_data.qpos,
+            qvel=next_data.qvel,
+            act=next_data.ctrl,
             mjx_model=mjx_model,
             mjx_data=next_data,
             info=info,

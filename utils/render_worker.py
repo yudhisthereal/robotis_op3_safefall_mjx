@@ -128,11 +128,34 @@ def _build_obs_from_mjdata(mj_model, mj_data) -> np.ndarray:
     joint_pos = qpos[7:]
     joint_vel = qvel[6:]
 
-    # IMU data from sensors
+    # Sensor slices matching envs/safefall_op3.py
+    def _ss(name: str):
+        sid = mj_model.sensor(name).id
+        adr = int(mj_model.sensor_adr[sid])
+        dim = int(mj_model.sensor_dim[sid])
+        return adr, adr + dim
+
+    accel_adr = _ss("torso_accel")
+    gyro_adr = _ss("torso_gyro")
+    quat_adr = _ss("torso_quat")
+    linvel_adr = _ss("torso_linvel")
+    angvel_adr = _ss("torso_angvel")
+
+    accel = sensordata[accel_adr[0]:accel_adr[1]]
+    gyro = sensordata[gyro_adr[0]:gyro_adr[1]]
+    quat = sensordata[quat_adr[0]:quat_adr[1]]
+    linvel = sensordata[linvel_adr[0]:linvel_adr[1]]
+    angvel = sensordata[angvel_adr[0]:angvel_adr[1]]
+
+    # Match training observation (56 dims)
     obs = np.concatenate([
-        joint_pos,          # 20
-        joint_vel,          # 20
-        sensordata,         # all sensor outputs (accelerometer, gyro, quat, etc.)
+        joint_pos,
+        joint_vel,
+        accel,
+        gyro,
+        quat,
+        linvel,
+        angvel,
     ])
     return obs.astype(np.float32)
 

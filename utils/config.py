@@ -18,7 +18,7 @@ class Config:
     # ── Environment ──────────────────────────────────────────────────
     env_name: str = "safefall_op3"
     num_envs: int = 1024
-    episode_max_steps: int = 1000
+    episode_max_steps: int = 40
     sim_dt: float = 0.002
     control_dt: float = 0.01  # 100 Hz control
     physics_steps_per_control: int = 5  # sim_dt * 5 = control_dt
