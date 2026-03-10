@@ -3,6 +3,6 @@
 __pycache__/
 runs/
 logs/
-
+wandb/
 .env
 
