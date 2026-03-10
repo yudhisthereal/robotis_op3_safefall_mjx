@@ -23,6 +23,10 @@ import os
 import time
 from collections import deque
 
+# Reduce GPU memory fragmentation / preallocation pressure for large MJX graphs.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+
 import jax
 import jax.numpy as jnp
 import numpy as np

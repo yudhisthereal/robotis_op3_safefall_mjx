@@ -13,14 +13,14 @@ Usage pattern inside the training loop::
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Optional
 
+from flax import struct
 import jax
 import jax.numpy as jnp
 
 
-@dataclasses.dataclass(frozen=True)
+@struct.dataclass
 class RolloutBuffer:
     """Immutable PPO rollout storage."""
 
@@ -70,8 +70,7 @@ class RolloutBuffer:
     ) -> "RolloutBuffer":
         """Store data for time-step *t*. Returns a new buffer."""
         new_goals = self.goals if goals is None else self.goals.at[t].set(goals)
-        return dataclasses.replace(
-            self,
+        return self.replace(
             obs=self.obs.at[t].set(obs),
             actions=self.actions.at[t].set(actions),
             rewards=self.rewards.at[t].set(rewards),
@@ -116,14 +115,13 @@ class RolloutBuffer:
         advantages = advantages_rev[::-1]  # un-reverse
 
         returns = advantages + self.values
-        return dataclasses.replace(self, advantages=advantages, returns=returns)
+        return self.replace(advantages=advantages, returns=returns)
 
     def flatten(self):
         """Flatten (T, N, ...) → (T*N, ...) for minibatch sampling."""
         T, N = self.obs.shape[0], self.obs.shape[1]
         flat = lambda x: x.reshape((T * N,) + x.shape[2:])
-        return dataclasses.replace(
-            self,
+        return self.replace(
             obs=flat(self.obs),
             actions=flat(self.actions),
             rewards=flat(self.rewards),

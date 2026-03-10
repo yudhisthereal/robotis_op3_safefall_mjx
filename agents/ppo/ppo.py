@@ -6,10 +6,10 @@ over rollout steps and minibatch updates.
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 from typing import Any, Callable, Dict, Tuple
 
+from flax import struct
 import jax
 import jax.numpy as jnp
 import optax
@@ -23,14 +23,13 @@ from utils.replay_buffer import RolloutBuffer
 # ── Training state ───────────────────────────────────────────────────
 
 
-@dataclasses.dataclass(frozen=True)
+@struct.dataclass
 class TrainState:
     """Immutable PPO training state carried through the training loop."""
     params: Any           # {"policy": …, "value": …}
     opt_state: Any        # Optax optimiser state
     step: jnp.ndarray     # scalar – global gradient step
     rng: jax.Array        # PRNG key
-
 
 # ── PPO Agent ────────────────────────────────────────────────────────
 
@@ -152,7 +151,7 @@ class PPOAgent:
             buffer.rewards, buffer.values, buffer.dones,
             last_values, cfg.gamma, cfg.gae_lambda,
         )
-        buffer = dataclasses.replace(buffer, advantages=advantages, returns=returns)
+        buffer = buffer.replace(advantages=advantages, returns=returns)
 
         # Flatten (T, N, …) → (T*N, …)
         flat = buffer.flatten()
