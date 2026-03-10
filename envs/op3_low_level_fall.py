@@ -19,11 +19,11 @@ metrics systems as the other environments.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+from flax import struct
 import mujoco
 import mujoco.mjx as mjx
 
@@ -32,6 +32,7 @@ from utils.domain_randomization import randomize_model
 from utils.perturbations import (
     PerturbationState,
     apply_all_perturbations,
+    apply_sensor_noise,
     init_perturbation_state,
 )
 from utils.metrics import compute_peak_torque
@@ -45,7 +46,7 @@ NUM_STRATEGIES = len(STRATEGIES)
 # ── Environment state ────────────────────────────────────────────────
 
 
-@dataclasses.dataclass(frozen=True)
+@struct.dataclass
 class LowLevelFallState:
     obs: jnp.ndarray
     reward: jnp.ndarray
@@ -257,12 +258,13 @@ class OP3LowLevelFallEnv:
     def step(
         self, state: LowLevelFallState, action: jnp.ndarray, rng: jax.Array
     ) -> LowLevelFallState:
+        rng_perturb, rng_obs = jax.random.split(rng)
         data = state.mjx_data
         mjx_model = state.mjx_model
 
-        qpos, qvel, xfrc, obs_noisy, delayed_action, new_ps = apply_all_perturbations(
-            data.qpos, data.qvel, data.xfrc_applied, state.obs, action,
-            state.perturbation_state, rng,
+        qpos, qvel, xfrc, delayed_action, new_ps = apply_all_perturbations(
+            data.qpos, data.qvel, data.xfrc_applied, action,
+            state.perturbation_state, rng_perturb,
             torso_body_index=self.torso_body_idx,
             foot_body_indices=self.foot_body_indices,
             push_prob=self.config.perturb_external_push_prob,
@@ -272,7 +274,6 @@ class OP3LowLevelFallEnv:
             trip_prob=self.config.perturb_foot_trip_prob,
             joint_noise_std=self.config.perturb_joint_noise_std,
             motor_delay_steps=self.config.perturb_motor_delay_steps,
-            sensor_noise_std=self.config.perturb_sensor_noise_std,
         )
 
         data = data.replace(qpos=qpos, qvel=qvel, xfrc_applied=xfrc, ctrl=jnp.clip(delayed_action, -1.0, 1.0))
@@ -281,7 +282,11 @@ class OP3LowLevelFallEnv:
             return mjx.step(mjx_model, d), None
         next_data, _ = jax.lax.scan(_substep, data, None, length=self.config.physics_steps_per_control)
 
-        new_obs = self._build_obs(next_data, state.goal)
+        new_obs = apply_sensor_noise(
+            self._build_obs(next_data, state.goal),
+            rng_obs,
+            self.config.perturb_sensor_noise_std,
+        )
         reward = self._compute_reward(next_data, state.mjx_data, delayed_action, state.goal)
         new_step = state.step_count + 1
         done = self._check_termination(next_data, new_step)

@@ -24,6 +24,9 @@ mediapy>=1.2
 moviepy>=2.0
 matplotlib>=3.8
 
+# GPU physics kernels (optional but fixes "import warp" errors)
+warp-lang>=1.12
+
 # Utilities
 tqdm>=4.66
 python-dotenv>=1.0

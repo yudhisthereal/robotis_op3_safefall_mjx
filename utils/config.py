@@ -111,6 +111,25 @@ class Config:
     dr_contact_solref_scale_range: Tuple[float, float] = (0.8, 1.2)
     dr_contact_solimp_scale_range: Tuple[float, float] = (0.9, 1.1)
 
+    def __post_init__(self):
+        if self.num_envs <= 0:
+            raise ValueError("num_envs must be > 0")
+        if self.rollout_length <= 0:
+            raise ValueError("rollout_length must be > 0")
+        if self.num_minibatches <= 0:
+            raise ValueError("num_minibatches must be > 0")
+        if self.physics_steps_per_control <= 0:
+            raise ValueError("physics_steps_per_control must be > 0")
+        if self.perturb_motor_delay_steps <= 0:
+            raise ValueError("perturb_motor_delay_steps must be > 0")
+
+        batch_size = self.num_envs * self.rollout_length
+        if batch_size % self.num_minibatches != 0:
+            raise ValueError(
+                "num_envs * rollout_length must be divisible by num_minibatches "
+                f"(got {batch_size} % {self.num_minibatches} != 0)"
+            )
+
     # ── Derived helpers ──────────────────────────────────────────────
     @property
     def batch_size(self) -> int:

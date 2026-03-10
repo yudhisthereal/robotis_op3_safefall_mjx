@@ -32,7 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 
 # Keep matmul precision stable across backends
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", False)
 jax.config.update("jax_default_matmul_precision", "float32")
 
 import wandb
@@ -175,6 +175,11 @@ def main():
     length_history: deque = deque(maxlen=config.plateau_window_episodes)
     peak_torque_history: deque = deque(maxlen=config.plateau_window_episodes)
     peak_contact_history: deque = deque(maxlen=config.plateau_window_episodes)
+    finished_count_total = 0
+    finished_reward_total = 0.0
+    finished_length_total = 0.0
+    finished_peak_torque_total = 0.0
+    finished_peak_contact_total = 0.0
     update_count = 0
 
     print("[run.py] Starting training loop …")
@@ -240,14 +245,19 @@ def main():
             finished_peak_cforce = jnp.where(done_mask, ep_pcf, 0.0)
 
             reset_keys = jax.random.split(key_reset, config.num_envs)
-            fresh_states = v_reset(reset_keys)
-            merged_states = jax.tree.map(
-                lambda fresh, cont: jnp.where(
-                    done_mask.reshape((-1,) + (1,) * (fresh.ndim - 1)), fresh, cont
-                ),
-                fresh_states,
-                next_states,
-            )
+
+            def _reset_if_done(xs):
+                state_i, key_i, done_i = xs
+
+                def _do_reset(_):
+                    return env.reset(key_i)
+
+                def _keep_state(_):
+                    return state_i
+
+                return jax.lax.cond(done_i, _do_reset, _keep_state, operand=None)
+
+            merged_states = jax.lax.map(_reset_if_done, (next_states, reset_keys, done_mask))
 
             ep_rew = jnp.where(done_mask, 0.0, ep_rew)
             ep_len = jnp.where(done_mask, 0, ep_len)
@@ -256,11 +266,11 @@ def main():
 
             new_carry = (merged_states, cur_buffer, ep_rew, ep_len, ep_pt, ep_pcf)
             out = (
-                done_mask,
-                finished_rewards,
-                finished_lengths,
-                finished_peak_torque,
-                finished_peak_cforce,
+                jnp.sum(done_mask.astype(jnp.int32)),
+                jnp.sum(finished_rewards),
+                jnp.sum(finished_lengths.astype(jnp.float32)),
+                jnp.sum(finished_peak_torque),
+                jnp.sum(finished_peak_cforce),
             )
             return new_carry, out
 
@@ -271,19 +281,22 @@ def main():
             (t_idx, step_keys),
         )
 
-        done_mask_t, finished_rewards_t, finished_lengths_t, finished_pt_t, finished_pcf_t = rollout_out
-        total_done = jnp.sum(done_mask_t.astype(jnp.int32))
+        done_count_t, finished_rewards_sum_t, finished_lengths_sum_t, finished_pt_sum_t, finished_pcf_sum_t = rollout_out
+        total_done = jnp.sum(done_count_t)
+        total_rewards = jnp.sum(finished_rewards_sum_t)
+        total_lengths = jnp.sum(finished_lengths_sum_t)
+        total_peak_torque = jnp.sum(finished_pt_sum_t)
+        total_peak_cforce = jnp.sum(finished_pcf_sum_t)
 
         last_values = agent.get_value(train_state.params, states.obs)
         train_state, update_metrics = agent.update(train_state, buffer, last_values)
 
         stats = {
-            "done_mask_t": done_mask_t,
-            "finished_rewards_t": finished_rewards_t,
-            "finished_lengths_t": finished_lengths_t,
-            "finished_pt_t": finished_pt_t,
-            "finished_pcf_t": finished_pcf_t,
             "num_finished": total_done,
+            "sum_reward_finished": total_rewards,
+            "sum_length_finished": total_lengths,
+            "sum_pt_finished": total_peak_torque,
+            "sum_pcf_finished": total_peak_cforce,
         }
         return train_state, states, next_rng, update_metrics, stats
 
@@ -292,19 +305,21 @@ def main():
             train_state, states, rng, update_metrics, stats = _train_iteration(train_state, states, rng)
 
             global_step += config.num_envs * config.rollout_length
-            global_episode += int(stats["num_finished"])
+            num_finished = int(stats["num_finished"])
+            global_episode += num_finished
 
-            done_mask_np = np.asarray(stats["done_mask_t"])
-            rew_np = np.asarray(stats["finished_rewards_t"])
-            len_np = np.asarray(stats["finished_lengths_t"])
-            pt_np = np.asarray(stats["finished_pt_t"])
-            pcf_np = np.asarray(stats["finished_pcf_t"])
+            if num_finished > 0:
+                finished_count_total += num_finished
+                finished_reward_total += float(stats["sum_reward_finished"])
+                finished_length_total += float(stats["sum_length_finished"])
+                finished_peak_torque_total += float(stats["sum_pt_finished"])
+                finished_peak_contact_total += float(stats["sum_pcf_finished"])
 
-            if done_mask_np.any():
-                reward_history.extend(rew_np[done_mask_np].tolist())
-                length_history.extend(len_np[done_mask_np].astype(np.float32).tolist())
-                peak_torque_history.extend(pt_np[done_mask_np].tolist())
-                peak_contact_history.extend(pcf_np[done_mask_np].tolist())
+                # Keep plateau logic functional with one scalar per update.
+                reward_history.append(float(stats["sum_reward_finished"]) / num_finished)
+                length_history.append(float(stats["sum_length_finished"]) / num_finished)
+                peak_torque_history.append(float(stats["sum_pt_finished"]) / num_finished)
+                peak_contact_history.append(float(stats["sum_pcf_finished"]) / num_finished)
 
             update_count += 1
 
@@ -312,10 +327,16 @@ def main():
             if update_count % config.log_interval == 0:
                 elapsed = time.time() - t_start
                 sps = global_step / max(elapsed, 1e-6)
-                mean_reward = float(np.mean(list(reward_history))) if reward_history else 0.0
-                mean_length = float(np.mean(list(length_history))) if length_history else 0.0
-                mean_peak_torque = float(np.mean(list(peak_torque_history))) if peak_torque_history else 0.0
-                mean_peak_contact = float(np.mean(list(peak_contact_history))) if peak_contact_history else 0.0
+                if finished_count_total > 0:
+                    mean_reward = finished_reward_total / finished_count_total
+                    mean_length = finished_length_total / finished_count_total
+                    mean_peak_torque = finished_peak_torque_total / finished_count_total
+                    mean_peak_contact = finished_peak_contact_total / finished_count_total
+                else:
+                    mean_reward = 0.0
+                    mean_length = 0.0
+                    mean_peak_torque = 0.0
+                    mean_peak_contact = 0.0
 
                 log_data = {
                     "episode_reward": mean_reward,

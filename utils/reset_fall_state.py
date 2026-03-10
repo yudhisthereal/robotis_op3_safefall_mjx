@@ -49,7 +49,7 @@ def sample_falling_state(
     """
 
     def _one_sample(key: jax.Array):
-        k_roll, k_pitch, k_yaw, k_h, k_qp, k_qv, k_bv = jax.random.split(key, 7)
+        k_roll, k_pitch, k_yaw, k_h, k_qp, k_qv, k_bv_lin, k_bv_ang = jax.random.split(key, 8)
 
         roll = jax.random.uniform(k_roll, (), minval=-jnp.deg2rad(60.0), maxval=jnp.deg2rad(60.0))
         pitch = jax.random.uniform(k_pitch, (), minval=-jnp.deg2rad(60.0), maxval=jnp.deg2rad(60.0))
@@ -64,8 +64,8 @@ def sample_falling_state(
         qpos = qpos.at[7:].add(jax.random.normal(k_qp, qpos[7:].shape) * joint_pos_noise_std)
 
         qvel = qvel_nominal
-        base_linvel = jax.random.normal(k_bv, (3,)) * base_linvel_std
-        base_angvel = jax.random.normal(k_bv, (3,)) * base_angvel_std
+        base_linvel = jax.random.normal(k_bv_lin, (3,)) * base_linvel_std
+        base_angvel = jax.random.normal(k_bv_ang, (3,)) * base_angvel_std
         qvel = qvel.at[0:3].set(base_linvel.astype(qvel.dtype))
         qvel = qvel.at[3:6].set(base_angvel.astype(qvel.dtype))
         qvel = qvel.at[6:].add(jax.random.normal(k_qv, qvel[6:].shape) * joint_vel_noise_std)

@@ -64,7 +64,8 @@ def evaluate(
         (final_state, _, total_reward, length, done), _ = jax.lax.scan(
             _step_fn, init, None, length=config.episode_max_steps
         )
-        success = done > 0.5  # episode ended naturally (not timeout)
+        # Treat pure timeout as non-success.
+        success = (done > 0.5) & (length < config.episode_max_steps)
         return total_reward, length, success
 
     keys = jax.random.split(rng, num_eval_episodes)

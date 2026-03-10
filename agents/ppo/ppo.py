@@ -61,10 +61,13 @@ class PPOAgent:
 
         # Optimiser
         if config.lr_schedule == "linear":
+            # Optax schedule internals run in JAX and can overflow when an
+            # oversized Python int is traced with x64 disabled.
+            transition_steps = int(min(config.total_timesteps, 2_147_483_647))
             lr_schedule = optax.linear_schedule(
                 init_value=config.learning_rate,
                 end_value=0.0,
-                transition_steps=config.total_timesteps,
+                transition_steps=transition_steps,
             )
         else:
             lr_schedule = config.learning_rate

@@ -19,7 +19,6 @@ Reward
 
 from __future__ import annotations
 
-import dataclasses
 import os
 from typing import Tuple
 
@@ -34,6 +33,7 @@ from utils.domain_randomization import randomize_model
 from utils.perturbations import (
     PerturbationState,
     apply_all_perturbations,
+    apply_sensor_noise,
     init_perturbation_state,
 )
 from utils.reset_fall_state import sample_falling_state
@@ -265,13 +265,14 @@ class SafeFallOP3Env:
         Returns:
             Next ``SafeFallState``.
         """
+        rng_perturb, rng_obs = jax.random.split(rng)
         data = state.mjx_data
         mjx_model = state.mjx_model
 
         # Apply perturbations
-        qpos, qvel, xfrc, obs, delayed_action, new_perturb = apply_all_perturbations(
-            data.qpos, data.qvel, data.xfrc_applied, state.obs, action,
-            state.perturbation_state, rng,
+        qpos, qvel, xfrc, delayed_action, new_perturb = apply_all_perturbations(
+            data.qpos, data.qvel, data.xfrc_applied, action,
+            state.perturbation_state, rng_perturb,
             torso_body_index=self.torso_body_idx,
             foot_body_indices=self.foot_body_indices,
             push_prob=self.config.perturb_external_push_prob,
@@ -281,7 +282,6 @@ class SafeFallOP3Env:
             trip_prob=self.config.perturb_foot_trip_prob,
             joint_noise_std=self.config.perturb_joint_noise_std,
             motor_delay_steps=self.config.perturb_motor_delay_steps,
-            sensor_noise_std=self.config.perturb_sensor_noise_std,
         )
 
         # Update data with perturbed values
@@ -302,7 +302,11 @@ class SafeFallOP3Env:
         )
 
         # Observation & reward
-        new_obs = self._build_obs(next_data)
+        new_obs = apply_sensor_noise(
+            self._build_obs(next_data),
+            rng_obs,
+            self.config.perturb_sensor_noise_std,
+        )
         reward = self._compute_reward(next_data, state.mjx_data, delayed_action)
         new_step = state.step_count + 1
         done = self._check_termination(next_data, new_step)

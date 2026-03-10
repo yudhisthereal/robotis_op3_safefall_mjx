@@ -243,7 +243,6 @@ def apply_all_perturbations(
     qpos: jnp.ndarray,
     qvel: jnp.ndarray,
     xfrc_applied: jnp.ndarray,
-    obs: jnp.ndarray,
     action: jnp.ndarray,
     perturbation_state: PerturbationState,
     rng: jax.Array,
@@ -258,13 +257,14 @@ def apply_all_perturbations(
     joint_noise_std: float = 0.02,
     motor_delay_steps: int = 2,
     sensor_noise_std: float = 0.01,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, PerturbationState]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, PerturbationState]:
     """Apply the full SafeFall-style perturbation pipeline.
 
     Returns:
-        (qpos, qvel, xfrc_applied, obs, delayed_action, perturbation_state)
+        (qpos, qvel, xfrc_applied, delayed_action, perturbation_state)
     """
-    keys = jax.random.split(rng, 6)
+    del sensor_noise_std
+    keys = jax.random.split(rng, 5)
 
     # Joint noise
     qpos, qvel = apply_joint_noise(qpos, qvel, keys[0], joint_noise_std, joint_noise_std)
@@ -287,7 +287,4 @@ def apply_all_perturbations(
         action, perturbation_state, motor_delay_steps
     )
 
-    # Sensor noise
-    obs = apply_sensor_noise(obs, keys[4], sensor_noise_std)
-
-    return qpos, qvel, xfrc_applied, obs, delayed_action, perturbation_state
+    return qpos, qvel, xfrc_applied, delayed_action, perturbation_state
