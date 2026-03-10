@@ -80,7 +80,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--no_render", action="store_true", help="Disable async render worker")
     p.add_argument("--headless", action="store_true", help="Render worker runs headless")
-    p.add_argument("--episode_max_steps", type=int, default=1000)
     return p.parse_args()
 
 
@@ -109,7 +108,6 @@ def main():
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         checkpoint_dir=args.checkpoint_dir,
-        episode_max_steps=args.episode_max_steps,
     )
 
     print(f"[run.py] Environment : {config.env_name}")

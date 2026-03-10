@@ -165,8 +165,8 @@ def _build_obs_from_mjdata(mj_model, mj_data) -> np.ndarray:
 
 def start_render_worker(
     scene_xml_path: str,
-    num_actions: int = 20,
-    episode_max_steps: int = 1000,
+    num_actions: int,
+    episode_max_steps: int,
     obs_dim: int = 56,
     hidden_sizes: tuple = (512, 256, 128),
     headless: bool = False,
